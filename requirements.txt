@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+
+httpx
+
+anthropic>=0.120.2
+
+python-dotenv
+
+pydantic>=2.11
+
+orjson
+
+tenacity
