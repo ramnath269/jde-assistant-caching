@@ -10,7 +10,7 @@ router = APIRouter(tags=["Chat"])
 async def process(request: ChatRequest):
 
     try:
-        result = await claude_service.process(request.prompt)
+        result = await claude_service.process(request.prompt,request.conversation_id)
         return ChatResponse(**result)
 
     except Exception as ex:

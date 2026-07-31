@@ -4,12 +4,14 @@ from typing import Any
 
 class ChatRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
+    conversation_id: str | None = Field(None, min_length=1)
 
 
 class ChatResponse(BaseModel):
     response: str
     tool_calls: list[dict[str, Any]]
     usage: dict[str, Any]
+    conversation_id: str | None = None
 
 class MCPTool(BaseModel):
 

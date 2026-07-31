@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     claude_api_key: str = Field(..., alias="CLAUDE_API_KEY")
 
     claude_model: str = Field(
-        default="claude-sonnet-5",
+        default="claude-haiku-4-5-20251001",
         alias="CLAUDE_MODEL",
     )
 

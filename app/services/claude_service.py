@@ -1,14 +1,15 @@
 from __future__ import annotations
-
 from dataclasses import asdict, dataclass
 from typing import Any
-
+import pprint
 from anthropic import AsyncAnthropic
 import json
 from anthropic.types import TextBlock, ToolUseBlock
 from app.config import settings
 from app.core.logger import logger
 from app.models import MCPTool
+from app.services import conversation_manager
+from app.services.conversation_manager import ConversationManager
 from app.services.mcp_client import MCPClient
 from app.services.tool_manager import ToolManager
 import json
@@ -67,9 +68,11 @@ class ClaudeService:
     def __init__(
         self,
         tool_manager: ToolManager,
+        conversation_manager: ConversationManager,
     ) -> None:
 
         self._tool_manager = tool_manager
+        self._conversation_manager = conversation_manager
 
         self._client = AsyncAnthropic(
             api_key=settings.claude_api_key,
@@ -202,6 +205,8 @@ class ClaudeService:
 
         logger.info("Sending request to Claude...")
 
+        pprint.pp(messages)
+
         response = await self._client.messages.create(
 
             model=settings.claude_model,
@@ -269,24 +274,31 @@ class ClaudeService:
     async def process(
         self,
         prompt: str,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         if not self._initialized:
             raise RuntimeError(
                 "ClaudeService.initialize() was not called."
             )
+        conversation_id = conversation_id or str(uuid.uuid4())
+
+        self._conversation_manager.create_if_not_exists(conversation_id)
 
         request_id = str(uuid.uuid4())
-        messages = [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ]
+
+        user_message = {
+            "role": "user",
+            "content": prompt,
+        }
+
+        self._conversation_manager.append(conversation_id, user_message)
+
+        messages = self._conversation_manager.get_messages(conversation_id)
+
 
         executed_tools = []
 
         while True:
-
             response = await self._call_claude(request_id, messages)
 
             tool_calls = self._find_tool_calls(response)
@@ -297,9 +309,20 @@ class ClaudeService:
             logger.info("Usage: %s", response.usage)
             if not tool_calls:
 
-                return {
+                assistant_message = {
+                    "role": "assistant",
+                    "content": self._extract_text(response),
+                }
 
-                    "response": self._extract_text(response),
+                self._conversation_manager.append(
+                    conversation_id,
+                    assistant_message,
+                )
+
+                return {
+                    "conversation_id": conversation_id,
+
+                    "response": assistant_message["content"],
 
                     "tool_calls": executed_tools,
 
@@ -307,15 +330,13 @@ class ClaudeService:
 
                 }
 
-            #
-            # Add Claude message
-            #
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": response.content,
-                }
-            )
+            # messages.append(assistant_message)
+            assistant_message = {
+                "role": "assistant",
+                "content": response.content,
+            }
+
+            self._conversation_manager.append(conversation_id, assistant_message)
 
             tool_results = []
 
@@ -355,11 +376,13 @@ class ClaudeService:
             #
             # Give tool results back to Claude
             #
-            messages.append(
-                {
-                    "role": "user",
-                    "content": tool_results,
-                }
+            tool_message = {
+                "role": "user",
+                "content": tool_results,
+            }
+            self._conversation_manager.append(conversation_id, tool_message)
+            messages = self._conversation_manager.get_messages(
+                conversation_id
             )
 
     async def reload_tools(self) -> None:

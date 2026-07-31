@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from app.api.health import router as health_router
 from app.api.process import router as process_router
 from app.api.tools import router as tools_router
+from app.api.conversation import router as conversation_router
 from app.core.logger import logger
 from app.services.dependencies import (
     claude_service,
@@ -55,6 +56,7 @@ app.add_middleware(
 app.include_router(health_router)
 app.include_router(process_router)
 app.include_router(tools_router)
+app.include_router(conversation_router)
 
 if __name__ == "__main__":
     import uvicorn
