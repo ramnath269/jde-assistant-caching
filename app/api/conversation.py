@@ -10,7 +10,7 @@ router = APIRouter(
 
 @router.get("/{conversation_id}")
 async def get_conversation(conversation_id: str):
-    return conversation_manager.get_messages(conversation_id)
+    return conversation_manager.get_display_messages(conversation_id)
 
 
 @router.delete("/{conversation_id}")
