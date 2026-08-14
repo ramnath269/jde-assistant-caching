@@ -41,3 +41,21 @@ class ToolCallRequest(BaseModel):
     tool_name: str
 
     parameters: dict = {}
+
+
+class LoginRequest(BaseModel):
+
+    username: str = Field(..., min_length=1)
+
+    password: str = Field(..., min_length=1)
+
+    environment: str = Field(..., min_length=1)
+
+
+class LoginResponse(BaseModel):
+
+    session_token: str
+
+    username: str
+
+    environment: str

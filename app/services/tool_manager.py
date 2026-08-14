@@ -57,6 +57,7 @@ class ToolManager:
         self,
         tool_name: str,
         arguments: dict[str, Any],
+        jde_session_id: str | None = None,
     ) -> Any:
         """
         Execute a tool through MCP.
@@ -72,6 +73,7 @@ class ToolManager:
         return await self._client.call_tool(
             tool_name,
             arguments,
+            jde_session_id,
         )
 
     def all(self) -> list[MCPTool]:

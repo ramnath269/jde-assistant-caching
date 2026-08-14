@@ -1,10 +1,12 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from app.api.deps import get_current_user
 from app.services.dependencies import tool_manager
 
 router = APIRouter(
     prefix="/tools",
     tags=["Tools"],
+    dependencies=[Depends(get_current_user)],
 )
 
 

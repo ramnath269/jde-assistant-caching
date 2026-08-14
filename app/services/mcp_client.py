@@ -56,6 +56,7 @@ class MCPClient:
         self,
         method: str,
         params: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
 
         self._request_id += 1
@@ -72,6 +73,9 @@ class MCPClient:
         if self._session_id:
             headers["mcp-session-id"] = self._session_id
 
+        if extra_headers:
+            headers.update(extra_headers)
+
         response = await self._client.post(
             settings.mcp_server_url,
             json=payload,
@@ -82,9 +86,6 @@ class MCPClient:
 
         if "mcp-session-id" in response.headers:
             self._session_id = response.headers["mcp-session-id"]
-        # print("Status:", response.status_code)
-        # print("Headers:", response.headers)
-        # print("Body:", repr(response.text))
         return self._parse_response(response.text)
 
     async def list_tools(self) -> list[dict]:
@@ -97,7 +98,14 @@ class MCPClient:
         self,
         tool_name: str,
         arguments: dict,
+        jde_session_id: str | None = None,
     ) -> dict:
+
+        extra_headers = (
+            {"X-JDE-Session": jde_session_id}
+            if jde_session_id
+            else None
+        )
 
         response = await self.request(
             "tools/call",
@@ -105,6 +113,7 @@ class MCPClient:
                 "name": tool_name,
                 "arguments": arguments,
             },
+            extra_headers=extra_headers,
         )
 
         return response["result"]

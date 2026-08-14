@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
 
+from app.api.auth import router as auth_router
 from app.api.health import router as health_router
 from app.api.process import router as process_router
 from app.api.tools import router as tools_router
@@ -9,6 +10,7 @@ from app.api.conversation import router as conversation_router
 from app.core.logger import logger
 from app.services.dependencies import (
     claude_service,
+    jde_auth_client,
     mcp_client,
     tool_manager,
 )
@@ -34,6 +36,7 @@ async def lifespan(app: FastAPI):
 
     print("8. Shutdown")
     await mcp_client.close()
+    await jde_auth_client.close()
 
 
 app = FastAPI(
@@ -53,6 +56,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router)
 app.include_router(health_router)
 app.include_router(process_router)
 app.include_router(tools_router)

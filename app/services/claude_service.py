@@ -11,12 +11,25 @@ from app.models import MCPTool
 from app.services import conversation_manager
 from app.services.conversation_manager import ConversationManager
 from app.services.mcp_client import MCPClient
+from app.services.mcp_payload import parse_text_payload
+from app.services.session_manager import SessionManager, UserSession
 from app.services.tool_manager import ToolManager
 import json
 import time
 import uuid
 
 from app.core.metrics_logger import metrics_logger
+
+#
+# Tools that must never be exposed to Claude (e.g. because they take
+# raw credentials).
+#
+HIDDEN_TOOLS = {"jde_get_token"}
+
+
+class AuthExpiredError(Exception):
+    """Raised when the MCP server reports the user's JDE session is dead."""
+
 
 SYSTEM_PROMPT = """
 You are JD Edwards EnterpriseOne AI Assistant.
@@ -69,10 +82,12 @@ class ClaudeService:
         self,
         tool_manager: ToolManager,
         conversation_manager: ConversationManager,
+        session_manager: SessionManager,
     ) -> None:
 
         self._tool_manager = tool_manager
         self._conversation_manager = conversation_manager
+        self._session_manager = session_manager
 
         self._client = AsyncAnthropic(
             api_key=settings.claude_api_key,
@@ -102,6 +117,7 @@ class ClaudeService:
       tools = [
           self._convert_tool(tool)
           for tool in all_tools
+          if tool.name not in HIDDEN_TOOLS
       ]
 
       # Add a cache checkpoint after the last tool
@@ -240,6 +256,7 @@ class ClaudeService:
         self,
         tool_name: str,
         arguments: dict[str, Any],
+        jde_session_id: str | None = None,
     ) -> Any:
 
         self._metrics.tool_calls += 1
@@ -248,6 +265,7 @@ class ClaudeService:
             return await self._tool_manager.execute(
                 tool_name,
                 arguments,
+                jde_session_id,
             )
 
         except Exception as ex:
@@ -274,6 +292,7 @@ class ClaudeService:
     async def process(
         self,
         prompt: str,
+        session: UserSession,
         conversation_id: str | None = None,
     ) -> dict[str, Any]:
         if not self._initialized:
@@ -283,6 +302,7 @@ class ClaudeService:
         conversation_id = conversation_id or str(uuid.uuid4())
 
         self._conversation_manager.create_if_not_exists(conversation_id)
+        self._session_manager.add_conversation(session.username, conversation_id)
 
         request_id = str(uuid.uuid4())
 
@@ -350,7 +370,22 @@ class ClaudeService:
                 result = await self._execute_tool(
                     tool.name,
                     tool.input,
+                    session.mcp_session_id,
                 )
+
+                payload = parse_text_payload(result)
+
+                if isinstance(payload, dict) and payload.get("auth_error") is True:
+                    logger.warning(
+                        "JDE session expired for user '%s' during tool '%s'.",
+                        session.username,
+                        tool.name,
+                    )
+                    self._session_manager.logout(session.session_token)
+
+                    raise AuthExpiredError(
+                        "Your JDE session has expired. Please log in again."
+                    )
 
                 executed_tools.append(
                     {
@@ -396,6 +431,7 @@ class ClaudeService:
         self._tools = tuple(
             self._convert_tool(tool)
             for tool in tools
+            if tool.name not in HIDDEN_TOOLS
         )
 
         logger.info(
