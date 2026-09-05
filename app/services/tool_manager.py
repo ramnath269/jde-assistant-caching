@@ -59,7 +59,9 @@ class ToolManager:
         arguments: dict[str, Any],
     ) -> Any:
         """
-        Execute a tool through MCP.
+        Execute a tool through MCP. Identity is carried by this instance's
+        MCPClient (bound to one user's bearer token at construction), not
+        passed per call.
         """
 
         if tool_name not in self._tools:

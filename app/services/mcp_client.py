@@ -15,17 +15,35 @@ from app.core.logger import logger
 PROTOCOL_VERSION = "2024-11-05"
 
 
-class MCPClient:
+class MCPAuthExpiredError(Exception):
     """
-    JSON-RPC client for Streamable HTTP MCP servers.
+    The bearer token this client was constructed with was rejected (HTTP 401).
+
+    Not recoverable by re-initializing -- the MCP server gates the entire
+    /mcp surface behind OAuth now, so initialize() would 401 with the same
+    stale token. The only way back is a fresh /auth/login.
     """
 
-    def __init__(self) -> None:
+
+class MCPClient:
+    """
+    JSON-RPC client for Streamable HTTP MCP servers, bound to ONE
+    authenticated JDE user for its whole lifetime.
+
+    The MCP server wraps its entire /mcp surface (including initialize
+    itself) in RequireAuthMiddleware, so every request -- not just tool
+    calls -- must carry this user's bearer token. That's why this is no
+    longer a single process-wide singleton: one instance is created per
+    logged-in user, right after their /auth/login, and closed on logout.
+    """
+
+    def __init__(self, bearer_token: str) -> None:
         self._client = httpx.AsyncClient(
             timeout=settings.request_timeout,
             headers={
                 "Accept": "application/json, text/event-stream",
                 "Content-Type": "application/json",
+                "Authorization": f"Bearer {bearer_token}",
             },
             follow_redirects=True,
         )
@@ -77,16 +95,19 @@ class MCPClient:
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
-        Send a JSON-RPC request, transparently re-establishing the MCP session
-        if the server no longer recognises ours.
+        Send a JSON-RPC request, transparently re-establishing the MCP
+        transport session if the server no longer recognises ours.
 
-        Streamable-HTTP sessions live only in the MCP server's memory, so any
-        restart or redeploy of that server invalidates our cached
-        mcp-session-id and every later call comes back 404 "Session not found"
-        (400 on some servers). Because the session was only ever created during
-        FastAPI startup, that state used to persist until FastAPI itself was
-        restarted -- and the 404 reached Claude as a tool error, which it
-        reported to users as a JDE/AOC outage. Re-initialize and retry once.
+        Streamable-HTTP sessions live only in the MCP server's memory, so
+        any restart or redeploy of that server invalidates our cached
+        mcp-session-id and the next call comes back 404 "Session not found"
+        (400 on some servers). Re-initialize and retry once.
+
+        A 401 is a different failure and must NOT be treated the same way:
+        it means our bearer token itself is stale/revoked, and initialize()
+        would 401 again with that same token -- retrying can't fix it. It's
+        raised as MCPAuthExpiredError so the caller can send the user back
+        through /auth/login instead of looping.
         """
 
         # A re-initialize in flight has already torn down self._session_id;
@@ -104,6 +125,12 @@ class MCPClient:
             return await self._send(method, params)
 
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 401:
+                raise MCPAuthExpiredError(
+                    "The MCP server rejected this bearer token; it has "
+                    "expired or been revoked."
+                ) from exc
+
             if not self._is_session_lost(exc.response):
                 raise
 

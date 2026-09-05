@@ -1,6 +1,8 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
-from app.services.dependencies import tool_manager
+from app.api.deps import get_current_user
+from app.services.claude_service import build_claude_tools
+from app.services.session_manager import UserSession
 
 router = APIRouter(
     prefix="/tools",
@@ -9,18 +11,21 @@ router = APIRouter(
 
 
 @router.get("")
-async def list_tools():
+async def list_tools(session: UserSession = Depends(get_current_user)):
 
     return {
-        "count": tool_manager.count,
-        "tools": tool_manager.all(),
+        "count": session.tool_manager.count,
+        "tools": session.tool_manager.all(),
     }
 
 
 @router.get("/{tool_name}")
-async def get_tool(tool_name: str):
+async def get_tool(
+    tool_name: str,
+    session: UserSession = Depends(get_current_user),
+):
 
-    tool = tool_manager.get(tool_name)
+    tool = session.tool_manager.get(tool_name)
 
     if tool is None:
         raise HTTPException(
@@ -32,11 +37,12 @@ async def get_tool(tool_name: str):
 
 
 @router.post("/reload")
-async def reload_tools():
+async def reload_tools(session: UserSession = Depends(get_current_user)):
 
-    await tool_manager.reload()
+    await session.tool_manager.reload()
+    session.claude_tools = build_claude_tools(session.tool_manager.all())
 
     return {
         "success": True,
-        "tool_count": tool_manager.count,
+        "tool_count": session.tool_manager.count,
     }

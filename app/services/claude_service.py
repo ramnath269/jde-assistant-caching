@@ -8,15 +8,53 @@ from anthropic.types import TextBlock, ToolUseBlock
 from app.config import settings
 from app.core.logger import logger
 from app.models import MCPTool
-from app.services import conversation_manager
 from app.services.conversation_manager import ConversationManager
-from app.services.mcp_client import MCPClient
-from app.services.tool_manager import ToolManager
+from app.services.mcp_client import MCPAuthExpiredError
+from app.services.session_manager import SessionManager, UserSession
 import json
 import time
 import uuid
 
 from app.core.metrics_logger import metrics_logger
+
+#
+# Tools that must never be exposed to Claude (e.g. because they take
+# raw credentials).
+#
+HIDDEN_TOOLS = {"jde_get_token"}
+
+
+class AuthExpiredError(Exception):
+    """Raised when the MCP server reports the user's bearer token is dead."""
+
+
+def convert_tool(tool: MCPTool) -> dict[str, Any]:
+    return {
+        "name": tool.name,
+        "description": tool.description,
+        "input_schema": tool.inputSchema,
+    }
+
+
+def build_claude_tools(tools: list[MCPTool]) -> tuple[dict[str, Any], ...]:
+    """
+    Turn one user's RBAC-filtered tool catalog into the Claude tools=[...]
+    shape. Called at login (and again on /tools/reload) - NOT once globally,
+    since different users can have a different tool set here.
+    """
+
+    converted = [
+        convert_tool(tool)
+        for tool in tools
+        if tool.name not in HIDDEN_TOOLS
+    ]
+
+    # Add a cache checkpoint after the last tool
+    if converted:
+        converted[-1] = {**converted[-1], "cache_control": {"type": "ephemeral"}}
+
+    return tuple(converted)
+
 
 SYSTEM_PROMPT = """
 You are JD Edwards EnterpriseOne AI Assistant.
@@ -67,67 +105,28 @@ class ClaudeService:
 
     def __init__(
         self,
-        tool_manager: ToolManager,
         conversation_manager: ConversationManager,
+        session_manager: SessionManager,
     ) -> None:
 
-        self._tool_manager = tool_manager
         self._conversation_manager = conversation_manager
+        self._session_manager = session_manager
 
         self._client = AsyncAnthropic(
             api_key=settings.claude_api_key,
         )
 
-        #
-        # Immutable after initialize()
-        #
-        self._tools: tuple[dict[str, Any], ...] = ()
-
-        self._system_prompt: list[dict[str, Any]] = []
+        self._system_prompt: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": SYSTEM_PROMPT,
+                "cache_control": {
+                    "type": "ephemeral"
+                },
+            }
+        ]
 
         self._metrics = ClaudeMetrics()
-
-        self._initialized = False
-
-    async def initialize(self) -> None:
-
-      if self._initialized:
-          return
-
-      logger.info("Initializing Claude service...")
-
-      all_tools = self._tool_manager.all()
-      # selected_tools = all_tools[:5]
-
-      tools = [
-          self._convert_tool(tool)
-          for tool in all_tools
-      ]
-
-      # Add a cache checkpoint after the last tool
-      if tools:
-          tools[-1]["cache_control"] = {
-              "type": "ephemeral"
-          }
-
-      self._tools = tuple(tools)
-
-      self._system_prompt = [
-          {
-              "type": "text",
-              "text": SYSTEM_PROMPT,
-              "cache_control": {
-                  "type": "ephemeral"
-              },
-          }
-      ]
-
-      self._initialized = True
-
-      logger.info(
-          "Claude initialized with %d tools.",
-          len(self._tools),
-      )
 
     @staticmethod
     def _find_tool_calls(response) -> list[ToolUseBlock]:
@@ -137,23 +136,11 @@ class ClaudeService:
             if isinstance(block, ToolUseBlock)
         ]
 
-    def _convert_tool(
-      self,
-      tool: MCPTool,
-  ) -> dict[str, Any]:
-
-      return {
-          "name": tool.name,
-          "description": tool.description,
-          "input_schema": tool.inputSchema,
-      }
-
     def _update_metrics(
         self,
         response,
     ) -> None:
 
-        usage = response.usage
         usage = response.usage
 
         cached = usage.cache_read_input_tokens
@@ -201,6 +188,7 @@ class ClaudeService:
         self,
         request_id: str,
         messages: list[dict[str, Any]],
+        tools: tuple[dict[str, Any], ...],
     ):
 
         logger.info("Sending request to Claude...")
@@ -215,7 +203,7 @@ class ClaudeService:
 
             system=self._system_prompt,
 
-            tools=list(self._tools),
+            tools=list(tools),
 
             messages=messages,
         )
@@ -227,7 +215,6 @@ class ClaudeService:
 
         self._log_metrics(
             request_id=request_id,
-            # request_type="initial",
             usage=response.usage,
             tool_name=tool_name,
         )
@@ -238,6 +225,7 @@ class ClaudeService:
 
     async def _execute_tool(
         self,
+        session: UserSession,
         tool_name: str,
         arguments: dict[str, Any],
     ) -> Any:
@@ -245,10 +233,17 @@ class ClaudeService:
         self._metrics.tool_calls += 1
 
         try:
-            return await self._tool_manager.execute(
+            return await session.tool_manager.execute(
                 tool_name,
                 arguments,
             )
+
+        except MCPAuthExpiredError:
+            # Let this propagate to process(), which turns it into
+            # AuthExpiredError - it is not a tool failure, it is "this whole
+            # session needs a fresh login", so it must not be swallowed into
+            # a {"success": False} result the model would just retry.
+            raise
 
         except Exception as ex:
             self._metrics.failed_tool_calls += 1
@@ -274,15 +269,13 @@ class ClaudeService:
     async def process(
         self,
         prompt: str,
+        session: UserSession,
         conversation_id: str | None = None,
     ) -> dict[str, Any]:
-        if not self._initialized:
-            raise RuntimeError(
-                "ClaudeService.initialize() was not called."
-            )
         conversation_id = conversation_id or str(uuid.uuid4())
 
         self._conversation_manager.create_if_not_exists(conversation_id)
+        self._session_manager.add_conversation(session.username, conversation_id)
 
         request_id = str(uuid.uuid4())
 
@@ -299,7 +292,7 @@ class ClaudeService:
         executed_tools = []
 
         while True:
-            response = await self._call_claude(request_id, messages)
+            response = await self._call_claude(request_id, messages, session.claude_tools)
 
             tool_calls = self._find_tool_calls(response)
 
@@ -330,7 +323,6 @@ class ClaudeService:
 
                 }
 
-            # messages.append(assistant_message)
             assistant_message = {
                 "role": "assistant",
                 "content": response.content,
@@ -347,10 +339,24 @@ class ClaudeService:
                     tool.name,
                 )
 
-                result = await self._execute_tool(
-                    tool.name,
-                    tool.input,
-                )
+                try:
+                    result = await self._execute_tool(
+                        session,
+                        tool.name,
+                        tool.input,
+                    )
+                except MCPAuthExpiredError:
+                    logger.warning(
+                        "MCP bearer token expired for user '%s' during tool '%s'.",
+                        session.username,
+                        tool.name,
+                    )
+                    await session.mcp_client.close()
+                    self._session_manager.logout(session.session_token)
+
+                    raise AuthExpiredError(
+                        "Your JDE session has expired. Please log in again."
+                    )
 
                 executed_tools.append(
                     {
@@ -385,31 +391,9 @@ class ClaudeService:
                 conversation_id
             )
 
-    async def reload_tools(self) -> None:
-
-        logger.info("Reloading Claude tool definitions...")
-
-        await self._tool_manager.reload()
-
-        tools = self._tool_manager.all()
-
-        self._tools = tuple(
-            self._convert_tool(tool)
-            for tool in tools
-        )
-
-        logger.info(
-            "Reloaded %d Claude tools.",
-            len(self._tools),
-        )
-
     def health(self) -> dict:
 
         return {
-
-            "initialized": self._initialized,
-
-            "tool_count": len(self._tools),
 
             "metrics": self.metrics(),
         }
